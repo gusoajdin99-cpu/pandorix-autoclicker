@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time
+import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -189,14 +190,67 @@ class AutoClickerEngine:
             return special
         return name.lower()
 
+    def _get_target_hwnd(self):
+        """Vraca HWND odabranog prozora, bez oslanjanja na fokus."""
+        if not HAS_WIN32:
+            return None
+        return self.app.get_selected_hwnd()
+
+    def _background_mouse_click(self, hwnd, button_name, double=False):
+        """Salje Windows mouse poruku direktno ciljanom prozoru.
+        Ne pomjera fizicki mis i korisnik moze normalno koristiti druge aplikacije.
+        """
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+
+        point = self.app.get_background_point()
+        if point is None:
+            return False
+
+        x, y = point
+        lparam = (int(y) << 16) | (int(x) & 0xFFFF)
+
+        down_up = {
+            "left": (win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP),
+            "right": (win32con.WM_RBUTTONDOWN, win32con.WM_RBUTTONUP),
+            "middle": (win32con.WM_MBUTTONDOWN, win32con.WM_MBUTTONUP),
+        }
+        if button_name not in down_up:
+            return False
+
+        down, up = down_up[button_name]
+        wparam = {
+            "left": win32con.MK_LBUTTON,
+            "right": win32con.MK_RBUTTON,
+            "middle": win32con.MK_MBUTTON,
+        }[button_name]
+
+        try:
+            win32gui.PostMessage(hwnd, down, wparam, lparam)
+            win32gui.PostMessage(hwnd, up, 0, lparam)
+            if double:
+                time.sleep(0.01)
+                win32gui.PostMessage(hwnd, down, wparam, lparam)
+                win32gui.PostMessage(hwnd, up, 0, lparam)
+            return True
+        except Exception:
+            return False
+
     def _perform_action(self):
         kind = self.app.click_keybind_type.get()
         value = self.app.click_keybind_value.get()
         double = self.app.double_click.get()
 
+        # Background Window mode: mouse clicks go directly to the selected HWND.
+        if self.app.background_mode.get() and kind == "mouse":
+            hwnd = self._get_target_hwnd()
+            if hwnd:
+                return self._background_mouse_click(hwnd, value, double)
+            return False
+
         if kind == "keyboard":
             if self.keyboard_ctrl is None:
-                return
+                return False
             key_obj = self._string_to_key(value)
             try:
                 self.keyboard_ctrl.press(key_obj)
@@ -204,14 +258,20 @@ class AutoClickerEngine:
                 if double:
                     self.keyboard_ctrl.press(key_obj)
                     self.keyboard_ctrl.release(key_obj)
+                return True
             except Exception:
-                pass
+                return False
         else:
             button = self._mouse_button_from_value(value)
             self.mouse.click(button, 2 if double else 1)
+            return True
 
     def _target_window_active(self):
-        """Provjerava da li je odabrani prozor trenutno aktivan (fokusiran)."""
+        """U starom modu provjerava fokus; background modu fokus nije potreban."""
+        if self.app.background_mode.get():
+            hwnd = self._get_target_hwnd()
+            return bool(hwnd and win32gui.IsWindow(hwnd))
+
         if not self.app.restrict_to_window.get():
             return True
         target = self.app.selected_window.get()
@@ -222,7 +282,6 @@ class AutoClickerEngine:
         current = WindowPicker.get_foreground_title()
         if current is None:
             return False
-        # Poredimo dio naziva (contains) da bi radilo i ako se naslov malo mijenja
         return target.lower() in current.lower()
 
     def _loop(self):
@@ -237,16 +296,15 @@ class AutoClickerEngine:
             interval = 1.0 / cps
 
             if self._target_window_active():
-                self._perform_action()
-                self.app.increment_click_count()
+                if self._perform_action():
+                    self.app.increment_click_count()
+                    self.app.set_waiting_for_window(False)
+                else:
+                    self.app.set_waiting_for_window(True)
             else:
-                # Prozor nije aktivan - pauziramo klikanje ali ostajemo "running"
                 self.app.set_waiting_for_window(True)
-                time.sleep(0.15)
-                continue
 
-            self.app.set_waiting_for_window(False)
-            time.sleep(interval)
+            time.sleep(interval if interval > 0 else 0.01)
 
 
 class PandorixApp:
@@ -269,6 +327,10 @@ class PandorixApp:
         self.double_click = tk.BooleanVar(value=False)
         self.restrict_to_window = tk.BooleanVar(value=False)
         self.selected_window = tk.StringVar(value="(nije odabran)")
+        self.selected_hwnd = None
+        self.background_mode = tk.BooleanVar(value=False)
+        self.background_x = tk.StringVar(value="0")
+        self.background_y = tk.StringVar(value="0")
         self.hotkey_var = tk.StringVar(value="F6")
 
         self._load_settings()
@@ -380,17 +442,23 @@ class PandorixApp:
         self._section_label(window_panel, "Ciljani prozor")
 
         self._row_checkbox(
-            window_panel, "Radi samo kada je odabrani prozor aktivan",
+            window_panel, "Ograniči na odabrani prozor (samo kad je aktivan)",
             self.restrict_to_window
         )
 
+        self._row_checkbox(
+            window_panel, "BACKGROUND MODE — radi i kad prozor nije aktivan",
+            self.background_mode
+        )
+
         picker_row = tk.Frame(window_panel, bg=BG_PANEL)
-        picker_row.pack(fill="x", padx=15, pady=(0, 10))
+        picker_row.pack(fill="x", padx=15, pady=(0, 6))
 
         self.window_combo = ttk.Combobox(
             picker_row, textvariable=self.selected_window, state="readonly", width=24
         )
         self.window_combo.pack(side="left", fill="x", expand=True, ipady=3)
+        self.window_combo.bind("<<ComboboxSelected>>", lambda e: self._remember_selected_window())
 
         refresh_btn = tk.Button(
             picker_row, text="⟳", command=self._refresh_window_list,
@@ -399,9 +467,31 @@ class PandorixApp:
         )
         refresh_btn.pack(side="right", padx=(8, 0))
 
+        pos_row = tk.Frame(window_panel, bg=BG_PANEL)
+        pos_row.pack(fill="x", padx=15, pady=(2, 6))
+
+        tk.Label(pos_row, text="Pozicija unutar prozora:", fg=TEXT_MAIN, bg=BG_PANEL,
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(pos_row, text="X", fg=TEXT_MUTED, bg=BG_PANEL).pack(side="left", padx=(10, 2))
+        tk.Entry(pos_row, textvariable=self.background_x, width=6, bg=BG_INPUT,
+                 fg=TEXT_MAIN, insertbackground=TEXT_MAIN, relief="flat",
+                 justify="center").pack(side="left")
+        tk.Label(pos_row, text="Y", fg=TEXT_MUTED, bg=BG_PANEL).pack(side="left", padx=(8, 2))
+        tk.Entry(pos_row, textvariable=self.background_y, width=6, bg=BG_INPUT,
+                 fg=TEXT_MAIN, insertbackground=TEXT_MAIN, relief="flat",
+                 justify="center").pack(side="left")
+
+        set_pos_btn = tk.Button(
+            pos_row, text="Postavi poziciju mišem", command=self._capture_background_position,
+            bg=BG_INPUT, fg=ACCENT, relief="flat", cursor="hand2",
+            activebackground=ACCENT, activeforeground="white"
+        )
+        set_pos_btn.pack(side="right")
+
         self.window_hint = tk.Label(
             window_panel,
-            text="Otvori Roblox (ili bilo koji program), klikni ⟳, pa ga odaberi sa liste.",
+            text="Background: odaberi prozor, klikni 'Postavi poziciju mišem', pa START. "
+                 "Pandorix tada šalje klikove direktno prozoru bez pomjeranja miša.",
             fg=TEXT_MUTED, bg=BG_PANEL, font=("Segoe UI", 8), wraplength=380, justify="left"
         )
         self.window_hint.pack(anchor="w", padx=15, pady=(0, 15))
@@ -477,15 +567,83 @@ class PandorixApp:
 
     def _refresh_window_list(self):
         windows = WindowPicker.list_windows()
-        titles = [w[1] for w in windows]
+        self._window_map = {title: hwnd for hwnd, title in windows}
+        titles = list(self._window_map.keys())
         if not titles:
             titles = ["(Windows funkcija - nedostupno van Windows-a)"]
         current = self.selected_window.get()
         self.window_combo["values"] = titles
         if current not in titles and titles:
             self.selected_window.set(titles[0])
+        self._remember_selected_window()
+
+    def _remember_selected_window(self):
+        self.selected_hwnd = getattr(self, "_window_map", {}).get(
+            self.selected_window.get()
+        )
+
+    def get_selected_hwnd(self):
+        self._remember_selected_window()
+        return self.selected_hwnd
+
+    def get_background_point(self):
+        try:
+            return int(float(self.background_x.get())), int(float(self.background_y.get()))
+        except (ValueError, TypeError):
+            return None
+
+    def _capture_background_position(self):
+        """Snima trenutnu poziciju misa kao koordinatu unutar odabranog prozora."""
+        if not HAS_WIN32:
+            messagebox.showerror(APP_NAME, "Background mode zahtijeva Windows + pywin32.")
+            return
+
+        hwnd = self.get_selected_hwnd()
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            messagebox.showwarning(APP_NAME, "Prvo odaberi ciljani prozor.")
+            return
+
+        try:
+            import pyautogui
+            screen_x, screen_y = pyautogui.position()
+        except ImportError:
+            # Bez dodatne biblioteke koristimo Win32 API za poziciju kursora.
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            screen_x, screen_y = pt.x, pt.y
+
+        try:
+            client_x, client_y = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
+            self.background_x.set(str(client_x))
+            self.background_y.set(str(client_y))
+            self.background_mode.set(True)
+            self.window_hint.config(
+                text=f"Background pozicija postavljena: X={client_x}, Y={client_y}. "
+                     "Možeš sada koristiti druge aplikacije i pokrenuti START."
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Ne mogu postaviti poziciju.\n\n{exc}")
 
     def _on_toggle(self):
+        if not self.engine.running and self.background_mode.get():
+            if not HAS_WIN32:
+                messagebox.showerror(APP_NAME, "Background mode radi samo na Windowsu.")
+                return
+            if not self.get_selected_hwnd():
+                messagebox.showwarning(APP_NAME, "Odaberi ciljani prozor prije START-a.")
+                return
+            if self.click_keybind_type.get() != "mouse":
+                messagebox.showwarning(
+                    APP_NAME,
+                    "Background mode trenutno podržava mouse klikove. "
+                    "Za tastaturu koristi normalni način rada."
+                )
+                return
+            if self.get_background_point() is None:
+                messagebox.showwarning(APP_NAME, "Unesi ispravne X/Y koordinate.")
+                return
         self.engine.toggle()
 
     def set_status(self, running):
@@ -664,6 +822,9 @@ class PandorixApp:
                 self.double_click.set(data.get("double_click", False))
                 self.restrict_to_window.set(data.get("restrict_to_window", False))
                 self.selected_window.set(data.get("selected_window", "(nije odabran)"))
+                self.background_mode.set(data.get("background_mode", False))
+                self.background_x.set(str(data.get("background_x", "0")))
+                self.background_y.set(str(data.get("background_y", "0")))
                 self.hotkey_var.set(data.get("hotkey", "F6"))
             except Exception:
                 pass
@@ -676,6 +837,9 @@ class PandorixApp:
             "double_click": self.double_click.get(),
             "restrict_to_window": self.restrict_to_window.get(),
             "selected_window": self.selected_window.get(),
+            "background_mode": self.background_mode.get(),
+            "background_x": self.background_x.get(),
+            "background_y": self.background_y.get(),
             "hotkey": self.hotkey_var.get(),
         }
         try:
