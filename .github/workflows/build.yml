@@ -1,0 +1,28 @@
+name: Build Pandorix EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Preuzmi fajlove
+        uses: actions/checkout@v4
+
+      - name: Podesi Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instaliraj biblioteke
+        run: pip install -r requirements.txt
+
+      - name: Napravi .exe
+        run: pyinstaller --noconfirm --onefile --windowed --icon=logo.ico --name "Pandorix AutoClicker" pandorix_autoclicker.py
+
+      - name: Sacuvaj .exe kao Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pandorix-AutoClicker-EXE
+          path: dist/Pandorix AutoClicker.exe
