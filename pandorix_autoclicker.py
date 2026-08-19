@@ -16,11 +16,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 try:
-    from pynput.mouse import Controller as MouseController, Button as MouseButton
+    from pynput.mouse import Controller as MouseController, Button as MouseButton, Listener as MouseListener
     from pynput import keyboard
 except ImportError:
     MouseController = None
     MouseButton = None
+    MouseListener = None
     keyboard = None
 
 # win32gui / win32process su Windows-only (dio pywin32 paketa).
@@ -145,6 +146,7 @@ class AutoClickerEngine:
         self.running = False
         self.thread = None
         self.mouse = MouseController() if MouseController else None
+        self.keyboard_ctrl = keyboard.Controller() if keyboard else None
 
     def start(self):
         if self.running:
@@ -170,13 +172,43 @@ class AutoClickerEngine:
         else:
             self.start()
 
-    def _get_button(self):
-        mapping = {
-            "Lijevi klik": MouseButton.left,
-            "Desni klik": MouseButton.right,
-            "Srednji klik": MouseButton.middle,
-        }
-        return mapping.get(self.app.click_type.get(), MouseButton.left)
+    def _mouse_button_from_value(self, value):
+        mapping = {"left": MouseButton.left, "right": MouseButton.right, "middle": MouseButton.middle}
+        if value == "x1" and hasattr(MouseButton, "x1"):
+            return MouseButton.x1
+        if value == "x2" and hasattr(MouseButton, "x2"):
+            return MouseButton.x2
+        return mapping.get(value, MouseButton.left)
+
+    def _string_to_key(self, name):
+        """Pretvara sacuvani naziv tipke (npr. 'ESC', 'F6', 'A') nazad u pynput objekat."""
+        if keyboard is None:
+            return name
+        special = getattr(keyboard.Key, name.lower(), None)
+        if special is not None:
+            return special
+        return name.lower()
+
+    def _perform_action(self):
+        kind = self.app.click_keybind_type.get()
+        value = self.app.click_keybind_value.get()
+        double = self.app.double_click.get()
+
+        if kind == "keyboard":
+            if self.keyboard_ctrl is None:
+                return
+            key_obj = self._string_to_key(value)
+            try:
+                self.keyboard_ctrl.press(key_obj)
+                self.keyboard_ctrl.release(key_obj)
+                if double:
+                    self.keyboard_ctrl.press(key_obj)
+                    self.keyboard_ctrl.release(key_obj)
+            except Exception:
+                pass
+        else:
+            button = self._mouse_button_from_value(value)
+            self.mouse.click(button, 2 if double else 1)
 
     def _target_window_active(self):
         """Provjerava da li je odabrani prozor trenutno aktivan (fokusiran)."""
@@ -203,11 +235,9 @@ class AutoClickerEngine:
                 cps = 1
 
             interval = 1.0 / cps
-            double_click = self.app.double_click.get()
 
             if self._target_window_active():
-                button = self._get_button()
-                self.mouse.click(button, 2 if double_click else 1)
+                self._perform_action()
                 self.app.increment_click_count()
             else:
                 # Prozor nije aktivan - pauziramo klikanje ali ostajemo "running"
@@ -231,7 +261,10 @@ class PandorixApp:
         self.engine = AutoClickerEngine(self)
         self._capturing_hotkey = False
 
-        self.click_type = tk.StringVar(value="Lijevi klik")
+        self.click_keybind_type = tk.StringVar(value="mouse")   # "mouse" ili "keyboard"
+        self.click_keybind_value = tk.StringVar(value="left")   # npr. "left"/"right"/"middle" ili "ESC"
+        self.keybind_display_var = tk.StringVar(value="Lijevi klik")
+        self._capturing_keybind = False
         self.cps_var = tk.StringVar(value="10")
         self.double_click = tk.BooleanVar(value=False)
         self.restrict_to_window = tk.BooleanVar(value=False)
@@ -240,6 +273,7 @@ class PandorixApp:
 
         self._load_settings()
         self._build_ui()
+        self._update_keybind_display()
         self._setup_hotkey_listener()
         self._refresh_window_list()
 
@@ -293,10 +327,23 @@ class PandorixApp:
         settings_panel.pack(fill="x", padx=20, pady=10)
         self._section_label(settings_panel, "Podešavanja klika")
 
-        self._row_dropdown(
-            settings_panel, "Dugme miša:", self.click_type,
-            ["Lijevi klik", "Desni klik", "Srednji klik"]
+        keybind_row = tk.Frame(settings_panel, bg=BG_PANEL)
+        keybind_row.pack(fill="x", padx=15, pady=6)
+        tk.Label(keybind_row, text="Keybind:", fg=TEXT_MAIN, bg=BG_PANEL,
+                 font=("Segoe UI", 10)).pack(side="left")
+        self.keybind_btn_text = tk.StringVar(value="Klikni")
+        self.keybind_btn = tk.Button(
+            keybind_row, textvariable=self.keybind_btn_text, command=self._start_keybind_capture,
+            bg=BG_INPUT, fg=ACCENT, relief="flat", width=12, cursor="hand2",
+            activebackground=ACCENT, activeforeground="white", font=("Segoe UI", 10, "bold")
         )
+        self.keybind_btn.pack(side="right", ipady=3)
+
+        self.keybind_current_label = tk.Label(
+            keybind_row, textvariable=self.keybind_display_var, fg=TEXT_MUTED, bg=BG_PANEL,
+            font=("Segoe UI", 9)
+        )
+        self.keybind_current_label.pack(side="right", padx=(0, 8))
 
         self._row_checkbox(settings_panel, "Dupli klik", self.double_click)
 
@@ -478,8 +525,8 @@ class PandorixApp:
             return
 
         def on_press(key):
-            if self._capturing_hotkey:
-                return  # dok snimamo novu precicu, ne pokrecemo/pauziramo klikanje
+            if self._capturing_hotkey or self._capturing_keybind:
+                return  # dok snimamo, ne pokrecemo/pauziramo klikanje
             key_name = self._key_to_name(key)
             if key_name == self.hotkey_var.get().upper():
                 self.root.after(0, self._on_toggle)
@@ -525,12 +572,94 @@ class PandorixApp:
         self.hotkey_btn.config(bg=BG_INPUT, fg=ACCENT)
         self._capturing_hotkey = False
 
+    def _mouse_label(self, value):
+        mapping = {
+            "left": "Lijevi klik", "right": "Desni klik", "middle": "Srednji klik",
+            "x1": "Bočno dugme 1", "x2": "Bočno dugme 2",
+        }
+        return mapping.get(value, value)
+
+    def _update_keybind_display(self):
+        kind = self.click_keybind_type.get()
+        value = self.click_keybind_value.get()
+        if kind == "mouse":
+            self.keybind_display_var.set(self._mouse_label(value))
+        else:
+            self.keybind_display_var.set(value)
+
+    def _start_keybind_capture(self):
+        """Ceka SLEDECI unos - bilo tipku na tastaturi ili klik misem - i vezuje ga kao keybind."""
+        if self._capturing_keybind or self._capturing_hotkey:
+            return
+        if keyboard is None or MouseListener is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Nedostaje 'pynput' biblioteka. Instaliraj je sa: pip install pynput"
+            )
+            return
+
+        self._capturing_keybind = True
+        self.keybind_btn_text.set("Pritisni...")
+        self.keybind_btn.config(bg=ACCENT, fg="white")
+
+        captured = {"done": False}
+
+        def stop_all():
+            try:
+                kb_listener.stop()
+            except Exception:
+                pass
+            try:
+                ms_listener.stop()
+            except Exception:
+                pass
+
+        def on_key_press(key):
+            if captured["done"]:
+                return False
+            captured["done"] = True
+            key_name = self._key_to_name(key)
+            self.root.after(0, lambda: self._finish_keybind_capture("keyboard", key_name))
+            stop_all()
+            return False
+
+        def on_mouse_click(x, y, button, pressed):
+            if captured["done"]:
+                return False
+            if not pressed:
+                return True  # cekamo pritisak (press), ne otpustanje (release)
+            captured["done"] = True
+            btn_name = str(button).replace("Button.", "")
+            self.root.after(0, lambda: self._finish_keybind_capture("mouse", btn_name))
+            stop_all()
+            return False
+
+        try:
+            kb_listener = keyboard.Listener(on_press=on_key_press)
+            ms_listener = MouseListener(on_click=on_mouse_click)
+            kb_listener.daemon = True
+            ms_listener.daemon = True
+            kb_listener.start()
+            ms_listener.start()
+        except Exception:
+            self._capturing_keybind = False
+            self.keybind_btn_text.set("Klikni")
+
+    def _finish_keybind_capture(self, kind, value):
+        self.click_keybind_type.set(kind)
+        self.click_keybind_value.set(value)
+        self._update_keybind_display()
+        self.keybind_btn_text.set("Klikni")
+        self.keybind_btn.config(bg=BG_INPUT, fg=ACCENT)
+        self._capturing_keybind = False
+
     def _load_settings(self):
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.click_type.set(data.get("click_type", "Lijevi klik"))
+                self.click_keybind_type.set(data.get("click_keybind_type", "mouse"))
+                self.click_keybind_value.set(data.get("click_keybind_value", "left"))
                 self.cps_var.set(str(data.get("cps", "10")))
                 self.double_click.set(data.get("double_click", False))
                 self.restrict_to_window.set(data.get("restrict_to_window", False))
@@ -541,7 +670,8 @@ class PandorixApp:
 
     def _save_settings(self):
         data = {
-            "click_type": self.click_type.get(),
+            "click_keybind_type": self.click_keybind_type.get(),
+            "click_keybind_value": self.click_keybind_value.get(),
             "cps": self.cps_var.get(),
             "double_click": self.double_click.get(),
             "restrict_to_window": self.restrict_to_window.get(),
@@ -573,6 +703,28 @@ def main():
     style = ttk.Style()
     try:
         style.theme_use("clam")
+    except Exception:
+        pass
+
+    try:
+        style.configure(
+            "TCombobox",
+            fieldbackground=BG_INPUT, background=BG_INPUT, foreground=TEXT_MAIN,
+            arrowcolor=ACCENT, bordercolor=BG_PANEL, lightcolor=BG_INPUT, darkcolor=BG_INPUT,
+            selectbackground=BG_INPUT, selectforeground=TEXT_MAIN, relief="flat",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BG_INPUT), ("!disabled", BG_INPUT)],
+            foreground=[("readonly", TEXT_MAIN)],
+            background=[("readonly", BG_INPUT)],
+            bordercolor=[("focus", ACCENT)],
+        )
+        root.option_add("*TCombobox*Listbox.background", BG_INPUT)
+        root.option_add("*TCombobox*Listbox.foreground", TEXT_MAIN)
+        root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        root.option_add("*TCombobox*Listbox.selectForeground", "white")
+        root.option_add("*TCombobox*Listbox.font", "{Segoe UI} 10")
     except Exception:
         pass
 
