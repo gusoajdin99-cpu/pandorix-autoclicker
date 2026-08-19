@@ -26,11 +26,22 @@ except ImportError:
 # win32gui / win32process su Windows-only (dio pywin32 paketa).
 try:
     import win32gui
+    import win32con
     import win32process
     import psutil
     HAS_WIN32 = True
 except ImportError:
     HAS_WIN32 = False
+
+# Sistemske/pomocne klase prozora koje ne predstavljaju stvarne pokrenute
+# aplikacije - filtriramo ih da lista bude cista.
+_SYSTEM_WINDOW_CLASSES = {
+    "Progman", "Button", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    "Windows.UI.Core.CoreWindow", "MultitaskingViewFrame",
+    "TopLevelWindowForOverflowXamlIsland", "XamlExplorerHostIslandWindow",
+    "SysShadow", "tooltips_class32", "NotifyIconOverflowWindow",
+    "DesktopWindowXamlSource", "ForegroundStaging", "MSCTFIME UI", "IME",
+}
 
 try:
     from PIL import Image, ImageTk
@@ -57,16 +68,59 @@ class WindowPicker:
     """Pomocna klasa za listanje otvorenih prozora na Windowsu."""
 
     @staticmethod
+    def _is_real_app_window(hwnd):
+        """Filtrira sistemske/pozadinske prozore koji nisu stvarno pokrenute aplikacije."""
+        if not win32gui.IsWindowVisible(hwnd):
+            return False
+
+        title = win32gui.GetWindowText(hwnd)
+        if not title or not title.strip():
+            return False
+
+        class_name = win32gui.GetClassName(hwnd)
+        if class_name in _SYSTEM_WINDOW_CLASSES:
+            return False
+
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        is_tool_window = bool(ex_style & win32con.WS_EX_TOOLWINDOW)
+        is_app_window = bool(ex_style & win32con.WS_EX_APPWINDOW)
+
+        # Tool-window prozori se obicno ne pojavljuju na taskbaru - preskoci ih
+        # osim ako su eksplicitno oznaceni kao app-window.
+        if is_tool_window and not is_app_window:
+            return False
+
+        # Prozori koji imaju "vlasnika" (owner) obicno su popup/dijaloski
+        # prozori nekog drugog prozora, ne samostalne pokrenute aplikacije.
+        owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+        if owner != 0 and not is_app_window:
+            return False
+
+        # Minimizirani/skriveni (cloaked) UWP prozori - preskoci ako mozemo provjeriti.
+        try:
+            import ctypes
+            DWMWA_CLOAKED = 14
+            cloaked = ctypes.c_int(0)
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+            )
+            if cloaked.value != 0:
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    @staticmethod
     def list_windows():
         results = []
         if not HAS_WIN32:
             return results
 
         def callback(hwnd, extra):
-            if win32gui.IsWindowVisible(hwnd):
+            if WindowPicker._is_real_app_window(hwnd):
                 title = win32gui.GetWindowText(hwnd)
-                if title and title.strip():
-                    results.append((hwnd, title))
+                results.append((hwnd, title))
             return True
 
         win32gui.EnumWindows(callback, None)
@@ -175,6 +229,7 @@ class PandorixApp:
 
         self.click_count = 0
         self.engine = AutoClickerEngine(self)
+        self._capturing_hotkey = False
 
         self.click_type = tk.StringVar(value="Lijevi klik")
         self.cps_var = tk.StringVar(value="10")
@@ -258,15 +313,24 @@ class PandorixApp:
         hotkey_row.pack(fill="x", padx=15, pady=(6, 15))
         tk.Label(hotkey_row, text="Prečica za Start/Pauza:", fg=TEXT_MAIN, bg=BG_PANEL,
                  font=("Segoe UI", 10)).pack(side="left")
-        hotkey_entry = tk.Entry(hotkey_row, textvariable=self.hotkey_var, width=8, bg=BG_INPUT,
-                                 fg=TEXT_MAIN, insertbackground=TEXT_MAIN, relief="flat",
-                                 justify="center")
-        hotkey_entry.pack(side="right", ipady=4)
+        self.hotkey_btn_text = tk.StringVar(value="Klikni")
+        self.hotkey_btn = tk.Button(
+            hotkey_row, textvariable=self.hotkey_btn_text, command=self._start_hotkey_capture,
+            bg=BG_INPUT, fg=ACCENT, relief="flat", width=12, cursor="hand2",
+            activebackground=ACCENT, activeforeground="white", font=("Segoe UI", 10, "bold")
+        )
+        self.hotkey_btn.pack(side="right", ipady=3)
+
+        self.hotkey_current_label = tk.Label(
+            hotkey_row, textvariable=self.hotkey_var, fg=TEXT_MUTED, bg=BG_PANEL,
+            font=("Segoe UI", 9)
+        )
+        self.hotkey_current_label.pack(side="right", padx=(0, 8))
 
         # ---- Ciljani prozor (posebna Pandorix funkcija) ----
         window_panel = tk.Frame(self.root, bg=BG_PANEL)
         window_panel.pack(fill="x", padx=20, pady=10)
-        self._section_label(window_panel, "Ciljani prozor (npr. Roblox)")
+        self._section_label(window_panel, "Ciljani prozor")
 
         self._row_checkbox(
             window_panel, "Radi samo kada je odabrani prozor aktivan",
@@ -312,6 +376,7 @@ class PandorixApp:
         )
         footer.pack(pady=(0, 10))
         self.footer_label = footer
+        self.hotkey_var.trace_add("write", lambda *args: self._update_footer())
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -392,20 +457,30 @@ class PandorixApp:
         elif self.engine.running:
             self.status_label.config(text="Aktivan")
 
+    def _update_footer(self):
+        self.footer_label.config(text=f"Prečica: {self.hotkey_var.get()}  |  Pandorix © 2026")
+
     def increment_click_count(self):
         self.click_count += 1
         # UI update sa glavnog threada preko 'after' zbog thread-safety
         self.root.after(0, lambda: self.count_label.config(text=f"Klikova: {self.click_count}"))
+
+    def _key_to_name(self, key):
+        try:
+            if hasattr(key, "char") and key.char:
+                return key.char.upper()
+            return str(key).replace("Key.", "").upper()
+        except Exception:
+            return str(key)
 
     def _setup_hotkey_listener(self):
         if keyboard is None:
             return
 
         def on_press(key):
-            try:
-                key_name = key.char.upper() if hasattr(key, "char") and key.char else str(key).replace("Key.", "").upper()
-            except Exception:
-                key_name = str(key)
+            if self._capturing_hotkey:
+                return  # dok snimamo novu precicu, ne pokrecemo/pauziramo klikanje
+            key_name = self._key_to_name(key)
             if key_name == self.hotkey_var.get().upper():
                 self.root.after(0, self._on_toggle)
 
@@ -415,6 +490,40 @@ class PandorixApp:
             listener.start()
         except Exception:
             pass
+
+    def _start_hotkey_capture(self):
+        """Cim korisnik klikne dugme, cekamo sledeci pritisak tipke i vezujemo ga kao precicu."""
+        if self._capturing_hotkey:
+            return
+        if keyboard is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Nedostaje 'pynput' biblioteka. Instaliraj je sa: pip install pynput"
+            )
+            return
+
+        self._capturing_hotkey = True
+        self.hotkey_btn_text.set("Pritisni tipku...")
+        self.hotkey_btn.config(bg=ACCENT, fg="white")
+
+        def on_capture(key):
+            key_name = self._key_to_name(key)
+            self.root.after(0, lambda: self._finish_hotkey_capture(key_name))
+            return False  # zaustavlja ovaj (jednokratni) listener
+
+        try:
+            capture_listener = keyboard.Listener(on_press=on_capture)
+            capture_listener.daemon = True
+            capture_listener.start()
+        except Exception:
+            self._capturing_hotkey = False
+            self.hotkey_btn_text.set("Klikni")
+
+    def _finish_hotkey_capture(self, key_name):
+        self.hotkey_var.set(key_name)
+        self.hotkey_btn_text.set("Klikni")
+        self.hotkey_btn.config(bg=BG_INPUT, fg=ACCENT)
+        self._capturing_hotkey = False
 
     def _load_settings(self):
         if os.path.exists(SETTINGS_FILE):
