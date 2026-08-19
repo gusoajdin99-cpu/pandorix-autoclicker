@@ -1,0 +1,5 @@
+pynput==1.7.7
+pywin32==306
+psutil==5.9.8
+Pillow==10.4.0
+pyinstaller==6.10.0
