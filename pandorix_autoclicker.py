@@ -236,17 +236,94 @@ class AutoClickerEngine:
         except Exception:
             return False
 
+    def _background_keyboard_action(self, hwnd, key_name, double=False):
+        """Salje WM_KEYDOWN/WM_KEYUP direktno ciljanom prozoru.
+        Ne uzima fokus od korisnika i ne koristi fizicku tastaturu.
+        """
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
+
+        # Pynput nazivi -> Windows virtual-key kodovi.
+        special_vk = {
+            "ESC": win32con.VK_ESCAPE,
+            "TAB": win32con.VK_TAB,
+            "ENTER": win32con.VK_RETURN,
+            "RETURN": win32con.VK_RETURN,
+            "SPACE": win32con.VK_SPACE,
+            "BACKSPACE": win32con.VK_BACK,
+            "DELETE": win32con.VK_DELETE,
+            "INSERT": win32con.VK_INSERT,
+            "HOME": win32con.VK_HOME,
+            "END": win32con.VK_END,
+            "PAGE_UP": win32con.VK_PRIOR,
+            "PAGE_DOWN": win32con.VK_NEXT,
+            "UP": win32con.VK_UP,
+            "DOWN": win32con.VK_DOWN,
+            "LEFT": win32con.VK_LEFT,
+            "RIGHT": win32con.VK_RIGHT,
+            "SHIFT": win32con.VK_SHIFT,
+            "CTRL": win32con.VK_CONTROL,
+            "CONTROL": win32con.VK_CONTROL,
+            "ALT": win32con.VK_MENU,
+            "CAPS_LOCK": win32con.VK_CAPITAL,
+            "NUM_LOCK": win32con.VK_NUMLOCK,
+            "SCROLL_LOCK": win32con.VK_SCROLL,
+            "PRINT_SCREEN": win32con.VK_SNAPSHOT,
+            "PAUSE": win32con.VK_PAUSE,
+        }
+
+        name = str(key_name).strip().upper()
+        vk = special_vk.get(name)
+
+        if vk is None:
+            # F1-F24
+            if name.startswith("F") and name[1:].isdigit():
+                fnum = int(name[1:])
+                if 1 <= fnum <= 24:
+                    vk = win32con.VK_F1 + (fnum - 1)
+
+        if vk is None and len(name) == 1:
+            # A-Z, 0-9 i osnovni znakovi.
+            try:
+                vk = ord(name)
+            except Exception:
+                vk = None
+
+        if vk is None:
+            # Pokusaj za nazive poput "Key.space" / "Key.enter".
+            normalized = name.replace("KEY.", "")
+            vk = special_vk.get(normalized)
+
+        if vk is None:
+            return False
+
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk, 0)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, 0)
+            if double:
+                time.sleep(0.01)
+                win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk, 0)
+                win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, 0)
+            return True
+        except Exception:
+            return False
+
     def _perform_action(self):
         kind = self.app.click_keybind_type.get()
         value = self.app.click_keybind_value.get()
         double = self.app.double_click.get()
 
-        # Background Window mode: mouse clicks go directly to the selected HWND.
-        if self.app.background_mode.get() and kind == "mouse":
+        # Background Window mode: mouse i keyboard idu direktno na odabrani HWND.
+        if self.app.background_mode.get():
             hwnd = self._get_target_hwnd()
-            if hwnd:
+            if not hwnd:
+                return False
+
+            if kind == "mouse":
                 return self._background_mouse_click(hwnd, value, double)
-            return False
+
+            if kind == "keyboard":
+                return self._background_keyboard_action(hwnd, value, double)
 
         if kind == "keyboard":
             if self.keyboard_ctrl is None:
@@ -490,8 +567,8 @@ class PandorixApp:
 
         self.window_hint = tk.Label(
             window_panel,
-            text="Background: odaberi prozor, klikni 'Postavi poziciju mišem', pa START. "
-                 "Pandorix tada šalje klikove direktno prozoru bez pomjeranja miša.",
+            text="Background: odaberi prozor. Za miš postavi X/Y poziciju, a za tastaturu samo "
+                 "izaberi tipku. START radi i kada koristiš druge aplikacije.",
             fg=TEXT_MUTED, bg=BG_PANEL, font=("Segoe UI", 8), wraplength=380, justify="left"
         )
         self.window_hint.pack(anchor="w", padx=15, pady=(0, 15))
@@ -634,14 +711,9 @@ class PandorixApp:
             if not self.get_selected_hwnd():
                 messagebox.showwarning(APP_NAME, "Odaberi ciljani prozor prije START-a.")
                 return
-            if self.click_keybind_type.get() != "mouse":
-                messagebox.showwarning(
-                    APP_NAME,
-                    "Background mode trenutno podržava mouse klikove. "
-                    "Za tastaturu koristi normalni način rada."
-                )
-                return
-            if self.get_background_point() is None:
+            # Background mode podržava i mouse i keyboard akcije.
+            # Za mouse klik mora postojati X/Y pozicija; za keyboard nije potrebna.
+            if self.click_keybind_type.get() == "mouse" and self.get_background_point() is None:
                 messagebox.showwarning(APP_NAME, "Unesi ispravne X/Y koordinate.")
                 return
         self.engine.toggle()
